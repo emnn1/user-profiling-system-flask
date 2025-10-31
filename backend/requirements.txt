@@ -1,9 +1,0 @@
-pydantic
-flask
-werkzeug
-pandas
-numpy
-torch
-torch-geometric
-shap
-faker
