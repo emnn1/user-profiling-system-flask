@@ -1,0 +1,61 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Environment variables
+.env
+.env.*
+
+# Distribution / packaging
+build/
+dist/
+.eggs/
+*.egg-info/
+*.egg
+
+# Logs
+logs/
+*.log
+
+# Testing
+.pytest_cache/
+.coverage*
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE/editor
+.vscode/
+.idea/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python cache and temporary files
+*.tmp
+*.temp
+
+# Streamlit/Gradio cache (if any)
+.streamlit/
+.gradio/
+
+# Node (if any generated later)
+node_modules/
+
+# Local data or secrets (add patterns as needed)
+*.sqlite3
+*.db
+
+# Compiled model artifacts
+*.pt
+*.pth
+*.onnx
