@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, Literal, Sequence
 
@@ -19,9 +19,14 @@ except ModuleNotFoundError as exc:  # pragma: no cover
         "GraphBuilder 依赖 torch-geometric，请先安装该库后再使用。"
     ) from exc
 
-from ..data_source.mock_data_provider import Event, EventType
+from ..data_source.mock_data_provider import (
+    DEFAULT_FILE_FORMAT,
+    Event,
+    EventType,
+    load_dataset_dataframe,
+)
 
-FILE_FORMAT = Literal["csv", "parquet"]
+FILE_FORMAT = Literal["sqlite"]
 NODE_TYPES = {"user", "product", "app"}
 EDGE_TYPE_CALL = ("user", EventType.CALL.value, "user")
 EDGE_TYPE_ORDER = ("user", EventType.ORDER.value, "product")
@@ -33,7 +38,7 @@ EDGE_TYPE_CLICK_APP = ("user", f"{EventType.CLICK.value}_app", "app")
 @dataclass(slots=True)
 class GraphBuildConfig:
     data_dir: Path
-    file_format: FILE_FORMAT = "csv"
+    file_format: FILE_FORMAT = DEFAULT_FILE_FORMAT
     device: str = "cpu"
     include_edge_timestamp: bool = True
 
@@ -137,6 +142,8 @@ class GraphBuilder:
         products_df = self._load_dataframe("products")
         apps_df = self._load_dataframe("apps")
         events_df = self._load_dataframe("events")
+        
+        print(f"图构建数据统计: users={len(users_df)}, products={len(products_df)}, apps={len(apps_df)}, events={len(events_df)}")
 
         if sample_ratio < 1.0:
             users_df = self._sample_frame(users_df, sample_ratio, rng)
@@ -176,6 +183,19 @@ class GraphBuilder:
         self._register_nodes(users_df, products_df, apps_df)
         self._append_edges_from_events(events_df.itertuples(index=False))
 
+        # 若历史事件为空，则按配置为每个用户合成随机初始边
+        if all(len(edges) == 0 for edges in self._edge_store.values()):
+            try:
+                # 延迟导入以避免模块初始化时的潜在循环依赖
+                from ..services.data_config import DataConfigStore
+                store = DataConfigStore(self.config.data_dir / "data_config.json")
+                gen_config = store.load_config()
+            except Exception:
+                gen_config = None
+            self._synthesize_initial_edges(rng, gen_config)
+        
+        print(f"边统计: {[(et, len(edges)) for et, edges in self._edge_store.items()]}")
+
         self._hetero_data = self._build_hetero_data()
         return self._hetero_data
 
@@ -206,7 +226,7 @@ class GraphBuilder:
         return self._hetero_data
 
     def _register_nodes(self, users_df: pd.DataFrame, products_df: pd.DataFrame, apps_df: pd.DataFrame) -> None:
-        """将 CSV/Parquet 的实体表注册为节点并缓存原始属性。"""
+        """将实体表注册为节点并缓存原始属性。"""
         for _, row in users_df.iterrows():
             user_id = str(row["user_id"])
             attrs = row.to_dict()
@@ -266,6 +286,118 @@ class GraphBuilder:
                 self._edge_store[EDGE_TYPE_CLICK_APP].append((source, target_app, timestamp))
                 has_new_edge = True
         return has_new_edge
+
+    def _synthesize_initial_edges(self, rng: np.random.Generator, gen_config: object | None) -> None:
+        """当历史事件为空时，按配置为每个用户生成随机初始边。
+        
+        生成的边类型包括：
+        - user-订购-product
+        - user-APP使用-app
+        - user-通话-user
+        - user-点击_product-product
+        - user-点击_app-app
+        
+        时间戳会均匀采样在 [now - history_days, now] 区间。
+        """
+        # 解析配置（容错：缺失时使用合理默认值）
+        try:
+            from ..services.data_config import DataGenerationConfig  # 延迟导入
+            cfg: DataGenerationConfig | None = gen_config if isinstance(gen_config, DataGenerationConfig) else None
+        except Exception:
+            cfg = None
+        history_days = getattr(cfg, "history_days", 30)
+        # 每用户边数范围
+        min_orders = getattr(cfg, "min_orders_per_user", 1)
+        max_orders = getattr(cfg, "max_orders_per_user", 3)
+        min_apps = getattr(cfg, "min_app_usages_per_user", 1)
+        max_apps = getattr(cfg, "max_app_usages_per_user", 3)
+        min_calls = getattr(cfg, "min_calls_per_user", 0)
+        max_calls = getattr(cfg, "max_calls_per_user", 2)
+        min_click_p = getattr(cfg, "min_click_products_per_user", 0)
+        max_click_p = getattr(cfg, "max_click_products_per_user", 5)
+        min_click_a = getattr(cfg, "min_click_apps_per_user", 0)
+        max_click_a = getattr(cfg, "max_click_apps_per_user", 5)
+
+        # 边界保护
+        def _bounded(low: int, high: int) -> tuple[int, int]:
+            low = max(0, int(low))
+            high = max(low, int(high))
+            return low, high
+        min_orders, max_orders = _bounded(min_orders, max_orders)
+        min_apps, max_apps = _bounded(min_apps, max_apps)
+        min_calls, max_calls = _bounded(min_calls, max_calls)
+        min_click_p, max_click_p = _bounded(min_click_p, max_click_p)
+        min_click_a, max_click_a = _bounded(min_click_a, max_click_a)
+
+        # 时间戳范围
+        now = datetime.utcnow()
+        start_ts = (now - timedelta(days=int(history_days))).timestamp()
+        end_ts = now.timestamp()
+        def _rand_ts() -> float:
+            u = rng.random()
+            return float(start_ts + u * (end_ts - start_ts))
+
+        num_users = len(self._user_reverse)
+        num_products = len(self._product_reverse)
+        num_apps = len(self._app_reverse)
+
+        if num_users == 0:
+            return  # 无用户，无法生成边
+
+        # 为每个用户生成边
+        for u_idx in range(num_users):
+            # 订购（user -> product）
+            if num_products > 0 and max_orders > 0:
+                k = rng.integers(min_orders, max_orders + 1)
+                k = int(min(k, num_products))
+                if k > 0:
+                    prod_indices = rng.choice(num_products, size=k, replace=False)
+                    for p in np.atleast_1d(prod_indices):
+                        self._edge_store[EDGE_TYPE_ORDER].append((u_idx, int(p), _rand_ts()))
+
+            # APP 使用（user -> app）
+            if num_apps > 0 and max_apps > 0:
+                k = rng.integers(min_apps, max_apps + 1)
+                k = int(min(k, num_apps))
+                if k > 0:
+                    app_indices = rng.choice(num_apps, size=k, replace=False)
+                    for a in np.atleast_1d(app_indices):
+                        self._edge_store[EDGE_TYPE_APP].append((u_idx, int(a), _rand_ts()))
+
+            # 通话（user -> user，避免 self-loop）
+            if num_users > 1 and max_calls > 0:
+                k = rng.integers(min_calls, max_calls + 1)
+                k = int(min(k, num_users - 1))
+                if k > 0:
+                    # 采样其他用户作为通话对象
+                    candidates = [i for i in range(num_users) if i != u_idx]
+                    targets = rng.choice(candidates, size=k, replace=False)
+                    for v in np.atleast_1d(targets):
+                        self._edge_store[EDGE_TYPE_CALL].append((u_idx, int(v), _rand_ts()))
+
+            # 点击产品（user -> product）
+            if num_products > 0 and max_click_p > 0:
+                k = rng.integers(min_click_p, max_click_p + 1)
+                k = int(min(k, num_products))
+                if k > 0:
+                    prod_indices = rng.choice(num_products, size=k, replace=False)
+                    for p in np.atleast_1d(prod_indices):
+                        self._edge_store[EDGE_TYPE_CLICK_PRODUCT].append((u_idx, int(p), _rand_ts()))
+
+            # 点击 APP（user -> app）
+            if num_apps > 0 and max_click_a > 0:
+                k = rng.integers(min_click_a, max_click_a + 1)
+                k = int(min(k, num_apps))
+                if k > 0:
+                    app_indices = rng.choice(num_apps, size=k, replace=False)
+                    for a in np.atleast_1d(app_indices):
+                        self._edge_store[EDGE_TYPE_CLICK_APP].append((u_idx, int(a), _rand_ts()))
+
+        # 简单日志
+        try:
+            print("已基于配置合成初始随机边（events 为空时）")
+        except Exception:
+            pass
 
     def _build_hetero_data(self) -> HeteroData:
         """根据缓存的节点与边构建 PyG ``HeteroData`` 对象。"""
@@ -342,14 +474,11 @@ class GraphBuilder:
 
     def _load_dataframe(self, name: str) -> pd.DataFrame:
         """从配置目录中加载指定表格。"""
-        path = self.config.data_dir / f"{name}.{self.config.file_format}"
-        if not path.exists():
-            raise FileNotFoundError(f"未找到数据文件: {path}")
-        if self.config.file_format == "csv":
-            df = pd.read_csv(path)
-        else:
-            df = pd.read_parquet(path)
-        return df
+        return load_dataset_dataframe(
+            name,
+            data_dir=self.config.data_dir,
+            file_format=self.config.file_format,
+        )
 
     @staticmethod
     def _row_to_event(row: pd.Series) -> Event:
@@ -381,6 +510,117 @@ class GraphBuilder:
         self._app_attributes.clear()
         self._edge_store.clear()
         self._hetero_data = None
+
+    def save_graph(self, save_path: str | Path) -> None:
+        """将当前构建的图保存到磁盘。
+        
+        使用 PyTorch 原生格式保存 HeteroData 对象及相关映射信息。
+        
+        Args:
+            save_path: 保存路径，会自动添加 .pt 扩展名（如果未提供）
+            
+        Raises:
+            RuntimeError: 如果图尚未构建
+        """
+        if self._hetero_data is None:
+            raise RuntimeError("图尚未构建，无法保存。请先调用 build_graph_from_snapshot 或 update_graph_from_events。")
+        
+        save_path = Path(save_path)
+        if not save_path.suffix:
+            save_path = save_path.with_suffix(".pt")
+        
+        # 确保父目录存在
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # 保存图数据和映射信息
+        save_data = {
+            "hetero_data": self._hetero_data,
+            "node_mapping": self.node_mapping,
+            "reverse_node_mapping": self.reverse_node_mapping,
+            "user_attributes": dict(self._user_attributes),
+            "product_attributes": dict(self._product_attributes),
+            "app_attributes": dict(self._app_attributes),
+        }
+        
+        torch.save(save_data, save_path)
+
+    def load_graph(self, load_path: str | Path) -> HeteroData:
+        """从磁盘加载已保存的图。
+        
+        Args:
+            load_path: 图文件路径
+            
+        Returns:
+            加载的 HeteroData 对象
+            
+        Raises:
+            FileNotFoundError: 如果文件不存在
+        """
+        load_path = Path(load_path)
+        if not load_path.exists():
+            raise FileNotFoundError(f"图文件不存在: {load_path}")
+        
+        # 加载数据
+        save_data = torch.load(load_path)
+        
+        # 恢复图数据
+        self._hetero_data = save_data["hetero_data"]
+        
+        # 恢复映射信息
+        node_mapping = save_data["node_mapping"]
+        self._user_id_map = dict(node_mapping.get("user", {}))
+        self._product_id_map = dict(node_mapping.get("product", {}))
+        self._app_id_map = dict(node_mapping.get("app", {}))
+        
+        reverse_mapping = save_data["reverse_node_mapping"]
+        self._user_reverse = list(reverse_mapping.get("user", []))
+        self._product_reverse = list(reverse_mapping.get("product", []))
+        self._app_reverse = list(reverse_mapping.get("app", []))
+        
+        # 恢复属性信息
+        self._user_attributes = dict(save_data.get("user_attributes", {}))
+        self._product_attributes = dict(save_data.get("product_attributes", {}))
+        self._app_attributes = dict(save_data.get("app_attributes", {}))
+        
+        return self._hetero_data
+
+    def get_graph_statistics(self) -> Dict[str, Any]:
+        """获取当前图的统计信息。
+        
+        Returns:
+            包含节点数、边数等统计信息的字典
+            
+        Raises:
+            RuntimeError: 如果图尚未构建
+        """
+        if self._hetero_data is None:
+            raise RuntimeError("图尚未构建，无法获取统计信息。")
+        
+        # 统计节点数
+        node_counts = {}
+        for node_type in self._hetero_data.node_types:
+            node_counts[node_type] = self._hetero_data[node_type].num_nodes
+        
+        # 统计边数
+        edge_counts = {}
+        total_edges = 0
+        for edge_type in self._hetero_data.edge_types:
+            edge_index = self._hetero_data[edge_type].edge_index
+            if edge_index is not None:
+                count = edge_index.size(1)
+                edge_counts[" / ".join(edge_type)] = count
+                total_edges += count
+            else:
+                edge_counts[" / ".join(edge_type)] = 0
+        
+        return {
+            "node_counts": node_counts,
+            "edge_counts": edge_counts,
+            "total_nodes": sum(node_counts.values()),
+            "total_edges": total_edges,
+            "node_types": list(self._hetero_data.node_types),
+            "edge_types": [" / ".join(et) for et in self._hetero_data.edge_types],
+        }
 
 
 __all__ = [

@@ -59,3 +59,8 @@ node_modules/
 *.pt
 *.pth
 *.onnx
+
+# Project-specific
+.cunzhi-memory/
+full_graph.pt
+*.sqlite

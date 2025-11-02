@@ -10,46 +10,18 @@
 所有对后端的请求均通过 :func:`_request` 进行封装，以确保错误处理一致性。"""
 from __future__ import annotations
 
-import os
 from typing import Any, Dict
 
 import pandas as pd
-import requests
-import streamlit as st
+import streamlit as st  # type: ignore[import]
 
-
-@st.cache_data(show_spinner=False)
-def _get_backend_base_url() -> str:
-    """解析后端基地址，支持 secrets 与环境变量兜底。"""
-
-    return (
-        st.secrets.get("backend_base_url")
-        or os.getenv("BACKEND_BASE_URL", "http://localhost:5000")
-    ).rstrip("/")
-
-
-def _request(method: str, path: str, payload: Dict[str, Any] | None = None) -> Dict[str, Any] | None:
-    """统一封装对规则接口的请求逻辑。"""
-
-    base_url = _get_backend_base_url()
-    try:
-        # 统一封装增删改查请求，确保异常输出友好
-        response = requests.request(method, f"{base_url}{path}", json=payload, timeout=5)
-        if response.status_code == 404:
-            return None
-        response.raise_for_status()
-        if not response.text:
-            return {}
-        return response.json()
-    except Exception as exc:  # pragma: no cover
-        st.error(f"调用后端规则接口失败: {exc}")
-        return None
+from utils import call_backend, get_json
 
 
 def _load_rules() -> pd.DataFrame:
     """加载规则列表并转换为 DataFrame。"""
 
-    data = _request("GET", "/api/v1/rules")
+    data = get_json("/api/v1/rules", timeout=5)
     if not data:
         return pd.DataFrame(columns=["name", "description", "weight", "condition"])
     rules = data.get("rules", [])
@@ -91,9 +63,14 @@ with st.expander("➕ 新增规则", expanded=False):
                     "weight": weight,
                     "condition": condition,
                 }
-                result = _request("POST", "/api/v1/rules", payload)
-                if result is not None:
-                    st.success("规则创建请求已发送，刷新页面以查看最新列表。")
+                call_backend(
+                    "/api/v1/rules",
+                    method="POST",
+                    payload=payload,
+                    timeout=5,
+                    spinner="正在新增规则...",
+                    success_message="规则创建请求已发送，刷新页面以查看最新列表。",
+                )
 
 with st.expander("✏️ 编辑规则", expanded=False):
     with st.form("edit_rule_form"):
@@ -112,9 +89,14 @@ with st.expander("✏️ 编辑规则", expanded=False):
                     "weight": new_weight,
                     "condition": new_condition,
                 }
-                result = _request("PUT", f"/api/v1/rules/{target}", payload)
-                if result is not None:
-                    st.success("规则更新请求已发送，刷新页面以查看最新列表。")
+                call_backend(
+                    f"/api/v1/rules/{target}",
+                    method="PUT",
+                    payload=payload,
+                    timeout=5,
+                    spinner="正在更新规则...",
+                    success_message="规则更新请求已发送，刷新页面以查看最新列表。",
+                )
 
 with st.expander("🗑️ 删除规则", expanded=False):
     with st.form("delete_rule_form"):
@@ -128,9 +110,13 @@ with st.expander("🗑️ 删除规则", expanded=False):
             elif not confirm:
                 st.warning("请勾选确认删除复选框")
             else:
-                result = _request("DELETE", f"/api/v1/rules/{target}")
-                if result is not None:
-                    st.success("规则删除请求已发送，刷新页面以查看最新列表。")
+                call_backend(
+                    f"/api/v1/rules/{target}",
+                    method="DELETE",
+                    timeout=5,
+                    spinner="正在删除规则...",
+                    success_message="规则删除请求已发送，刷新页面以查看最新列表。",
+                )
 
 st.info(
     "提示：若规则列表无法加载，请确认后端已提供 `/api/v1/rules` 系列接口，或在开发阶段手动更新规则配置。"

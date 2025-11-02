@@ -46,6 +46,7 @@ class DataIngestionService:
         self._preload_batch_size = max(1, preload_batch_size)
         self._queue: asyncio.Queue[Event] = asyncio.Queue()
         self._lock = asyncio.Lock()
+        self._warm_lock = asyncio.Lock()
         self._event_task: asyncio.Task[None] | None = None
         self._user_profiles: dict[str, dict[str, Any]] = {}
         self._last_event_timestamp = datetime.utcnow() - realtime_start_offset
@@ -100,6 +101,17 @@ class DataIngestionService:
                         },
                     )
             page += 1
+
+    async def ensure_cache_warm(self) -> None:
+        """确保在未启动摄取任务时也完成用户缓存预热。"""
+
+        if self._user_profiles:
+            return
+
+        async with self._warm_lock:
+            if self._user_profiles:
+                return
+            await self._load_all_users()
 
     async def _stream_events(self) -> None:
         """持续监听实时事件流，并交由处理函数更新缓存。"""

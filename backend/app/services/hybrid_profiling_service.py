@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
@@ -329,12 +330,14 @@ class HybridProfilingService:
         epochs: int = 3,
         lr: float = 1e-3,
         batch_size: int = 64,
+        progress_cb: Callable[[Dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """使用缓存用户构造数据集，训练融合核心参数。"""
 
         if self.incremental_learner is None:
             return {"trained": False, "reason": "incremental learner unavailable"}
 
+        await self.data_ingestion.ensure_cache_warm()
         user_ids = await self.data_ingestion.list_cached_user_ids()
         if not user_ids:
             return {"trained": False, "reason": "no cached users"}
@@ -376,9 +379,22 @@ class HybridProfilingService:
         optimizer = torch.optim.Adam(self.fusion_core.parameters(), lr=lr)
         self.fusion_core.train()
 
+        actual_epochs = max(1, epochs)
+        if progress_cb is not None:
+            progress_cb(
+                {
+                    "event": "start",
+                    "total_epochs": actual_epochs,
+                    "samples": len(samples),
+                    "learning_rate": lr,
+                }
+            )
+
         last_loss: float = 0.0
-        for _ in range(max(1, epochs)):
+        for epoch_idx in range(actual_epochs):
+            epoch_start = time.perf_counter()
             random.shuffle(samples)
+            epoch_losses: list[float] = []
             for idx in range(0, len(samples), max(1, batch_size)):
                 batch = samples[idx : idx + max(1, batch_size)]
                 h_rule_batch = torch.stack([item["h_rule"] for item in batch])
@@ -392,8 +408,30 @@ class HybridProfilingService:
                 loss.backward()
                 optimizer.step()
                 last_loss = float(loss.item())
+                epoch_losses.append(last_loss)
+
+            if progress_cb is not None and epoch_losses:
+                progress_cb(
+                    {
+                        "event": "epoch",
+                        "epoch": epoch_idx + 1,
+                        "total_epochs": actual_epochs,
+                        "loss": sum(epoch_losses) / len(epoch_losses),
+                        "duration_seconds": time.perf_counter() - epoch_start,
+                        "samples": len(samples),
+                        "learning_rate": lr,
+                    }
+                )
 
         self.fusion_core.eval()
+        if progress_cb is not None:
+            progress_cb(
+                {
+                    "event": "complete",
+                    "epochs": actual_epochs,
+                    "final_loss": last_loss,
+                }
+            )
         return {
             "trained": True,
             "samples": len(samples),

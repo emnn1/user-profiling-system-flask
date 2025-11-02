@@ -68,7 +68,6 @@ class HGTModel(nn.Module):
                     out_channels=out_dim,
                     metadata=config.metadata,
                     heads=config.num_heads,
-                    dropout=config.dropout,
                 )
             )
             in_channels = {nt: out_dim for nt in self.node_types}

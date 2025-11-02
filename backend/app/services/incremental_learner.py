@@ -258,6 +258,18 @@ class IncrementalLearner:
         hetero_data = self.latest_data
         if hetero_data is None:
             return
+        
+        # 检查图中是否有边，如果没有边则跳过嵌入刷新
+        has_edges = False
+        for edge_type in hetero_data.edge_types:
+            edge_store = hetero_data[edge_type]
+            if edge_store.edge_index is not None and edge_store.edge_index.numel() > 0:
+                has_edges = True
+                break
+        
+        if not has_edges:
+            print("警告：图中没有边信息，跳过嵌入刷新")
+            return
 
         device = next(self.model.parameters()).device
         feature_inputs: Dict[str, torch.Tensor] = {}

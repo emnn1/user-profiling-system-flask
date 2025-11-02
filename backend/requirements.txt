@@ -7,3 +7,6 @@ torch
 torch-geometric
 shap
 faker
+sqlalchemy
+psutil
+pymetis
